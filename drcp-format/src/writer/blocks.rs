@@ -178,7 +178,7 @@ fn write_signed(writer: &mut impl Write, value: i64) -> std::io::Result<()> {
     write_varint(writer, ((value << 1) ^ (value >> 63)) as u64)
 }
 
-impl<W: Write, Int: IntValue + Hash> BlockProofWriter<W, Int> {
+impl<W: Write, Int: IntValue + Hash + Into<i64>> BlockProofWriter<W, Int> {
     /// Write a line: a text record in the binary form, except an inference line inside a
     /// resolution, refutation or dominance block, which is a binary record.
     fn write_text_line(&mut self, line: &str) -> std::io::Result<()> {
@@ -190,6 +190,7 @@ impl<W: Write, Int: IntValue + Hash> BlockProofWriter<W, Int> {
                     && let Some((codes, constraint, label, hint)) = parse_inference_line(line)
                 {
                     return self.write_inference_record(
+                        false,
                         codes.iter().copied(),
                         codes.len(),
                         constraint,
@@ -208,17 +209,23 @@ impl<W: Write, Int: IntValue + Hash> BlockProofWriter<W, Int> {
         }
     }
 
-    /// Write the binary record of an inference line.
+    /// Write the binary record of an inference line: of tag 4, without the number of
+    /// references, for a premise-free line, and of tag 3 otherwise.
     fn write_inference_record(
         &mut self,
+        premise_free: bool,
         codes: impl Iterator<Item = i64>,
         num_codes: usize,
         constraint: u32,
         label: u32,
         hint: &[u32],
     ) -> std::io::Result<()> {
-        self.writer.write_all(&[3])?;
-        write_varint(&mut self.writer, num_codes as u64)?;
+        if premise_free {
+            self.writer.write_all(&[4])?;
+        } else {
+            self.writer.write_all(&[3])?;
+            write_varint(&mut self.writer, num_codes as u64)?;
+        }
         for code in codes {
             write_signed(&mut self.writer, code)?;
         }
@@ -244,6 +251,7 @@ impl<W: Write, Int: IntValue + Hash> BlockProofWriter<W, Int> {
         let constraint = constraint.map(NonZero::get).unwrap_or(0);
         if prefix.is_none() && self.binary_names.is_some() {
             return self.write_inference_record(
+                false,
                 codes.iter().map(|code| i64::from(code.get())),
                 codes.len(),
                 constraint,
@@ -426,15 +434,14 @@ impl<W: Write, Int: IntValue + Hash> BlockProofWriter<W, Int> {
     ) -> std::io::Result<()> {
         let constraint = constraint.map(NonZero::get).unwrap_or(0);
         if self.binary_names.is_some() {
-            self.writer.write_all(&[4])?;
-            write_signed(&mut self.writer, i64::from(consequent.get()))?;
-            write_varint(&mut self.writer, u64::from(constraint))?;
-            write_varint(&mut self.writer, u64::from(label.get()))?;
-            write_varint(&mut self.writer, hint.len() as u64)?;
-            for &position in hint {
-                write_varint(&mut self.writer, u64::from(position))?;
-            }
-            return Ok(());
+            return self.write_inference_record(
+                true,
+                std::iter::once(i64::from(consequent.get())),
+                1,
+                constraint,
+                label.get(),
+                hint,
+            );
         }
         let mut line = format!("  > {consequent} c:{constraint} l:{label}");
         for (index, position) in hint.iter().enumerate() {
@@ -513,42 +520,52 @@ impl<W: Write, Int: IntValue + Hash> BlockProofWriter<W, Int> {
             let _ = self.defined_atomics.insert(key.clone(), id);
             let _ = self.defined_atomics.insert(!key.clone(), -id);
 
-            self.block_prefix = b'a';
-            match self.binary_names.as_mut() {
-                Some(names) => {
-                    let next = names.len() as u64 + 1;
-                    let number = match names.get(&key.name) {
-                        Some(&number) => number,
-                        None => {
-                            let _ = names.insert(Rc::clone(&key.name), next);
-                            self.writer.write_all(&[1])?;
-                            write_varint(&mut self.writer, key.name.len() as u64)?;
-                            self.writer.write_all(key.name.as_bytes())?;
-                            next
-                        }
-                    };
-                    self.writer.write_all(&[2])?;
-                    write_varint(&mut self.writer, id.get() as u64)?;
-                    write_varint(&mut self.writer, number)?;
-                    let comparator = match key.comparison {
-                        IntComparison::LessEqual => 0,
-                        IntComparison::GreaterEqual => 1,
-                        IntComparison::Equal => 2,
-                        IntComparison::NotEqual => 3,
-                    };
-                    self.writer.write_all(&[comparator])?;
-                    let constant: i64 = key
-                        .value
-                        .to_string()
-                        .parse()
-                        .expect("an integer value prints as an integer");
-                    write_signed(&mut self.writer, constant)?;
-                }
-                None => writeln!(&mut self.writer, "a {id} {key}")?,
-            }
+            self.write_atomic(id, &key.name, key.comparison, key.value.clone().into())?;
         }
 
         Ok(self.defined_atomics[&key])
+    }
+
+    /// Write the declaration of an atomic constraint, `a <reference> [<name> <comparison>
+    /// <constant>]`; in the binary form a record of tag 2, after a record of tag 1 with the name
+    /// if it is new.
+    fn write_atomic(
+        &mut self,
+        reference: NonZero<i32>,
+        name: &str,
+        comparison: IntComparison,
+        constant: i64,
+    ) -> std::io::Result<()> {
+        self.block_prefix = b'a';
+        let Some(names) = self.binary_names.as_mut() else {
+            return writeln!(
+                &mut self.writer,
+                "a {reference} {}",
+                IntAtomic::new(name, comparison, constant)
+            );
+        };
+        let next = names.len() as u64 + 1;
+        let number = match names.get(name) {
+            Some(&number) => number,
+            None => {
+                let _ = names.insert(name.into(), next);
+                self.writer.write_all(&[1])?;
+                write_varint(&mut self.writer, name.len() as u64)?;
+                self.writer.write_all(name.as_bytes())?;
+                next
+            }
+        };
+        self.writer.write_all(&[2])?;
+        write_varint(&mut self.writer, reference.get() as u64)?;
+        write_varint(&mut self.writer, number)?;
+        let comparator = match comparison {
+            IntComparison::LessEqual => 0,
+            IntComparison::GreaterEqual => 1,
+            IntComparison::Equal => 2,
+            IntComparison::NotEqual => 3,
+        };
+        self.writer.write_all(&[comparator])?;
+        write_signed(&mut self.writer, constant)
     }
 
     fn get_label_code<Label: Into<Box<str>>>(
