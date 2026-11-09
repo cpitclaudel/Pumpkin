@@ -1136,6 +1136,7 @@ version = "0.5.0"
 dependencies = [
  "cc",
  "clap",
+ "drcp-format",
  "env_logger",
  "flatzinc",
  "log",

@@ -5,7 +5,8 @@
 //! format, as resolution chains and as refutations, and each also for the checker's lenient reading
 //! within the root domains (`--root-domains`), which the proof's header `m lenient` names. When the
 //! environment variable `CROC_CHECK` names the fzn-croc-check binary, the proofs are checked, in
-//! the reading their header names.
+//! the reading their header names. Each proof is written in both encodings, and converts byte
+//! for byte to itself and to the other.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -124,6 +125,7 @@ fn symmetry_star_dropping_unused_steps() {
             derivation,
             "c UPPER_BOUND 5",
             &["--drop-unused-breaking-steps"],
+            "text",
         );
     }
 }
@@ -135,13 +137,14 @@ fn dominance_knapsack_dropping_unused_steps() {
     let (model_path, scaffold_path) = solve(name, "dominance_knapsack", &["--dominance-breaking"]);
     let left_out = regex::Regex::new(r"Leaving out [1-9][0-9]* of [0-9]+ held steps").unwrap();
     for derivation in ["resolution", "refutation"] {
-        let (log, _) = process_and_check(
+        let (log, ..) = process_and_check(
             name,
             &model_path,
             &scaffold_path,
             derivation,
             "c UPPER_BOUND 24",
             &["--drop-unused-breaking-steps"],
+            "text",
         );
         assert!(left_out.is_match(&log), "no step is left out:\n{log}");
     }
@@ -152,13 +155,14 @@ fn dual_fixing_knapsack_dropping_unused_steps() {
     let name = "dual_fixing_knapsack_dropping_unused_steps";
     let (model_path, scaffold_path) = solve(name, "dual_fixing_knapsack", &["--dual-fixing"]);
     for derivation in ["resolution", "refutation"] {
-        let (_, proof) = process_and_check(
+        let (_, proof, _) = process_and_check(
             name,
             &model_path,
             &scaffold_path,
             derivation,
             "c UPPER_BOUND 24",
             &["--drop-unused-breaking-steps"],
+            "text",
         );
         assert!(
             !proof.lines().any(|line| line.starts_with("w ")),
@@ -198,6 +202,7 @@ fn objective_view_through_a_pipe() {
         "refutation",
         "c UPPER_BOUND 28",
         &[],
+        "text",
     );
 
     assert!(solver_process.wait().unwrap().success());
@@ -233,13 +238,25 @@ fn run_pipeline(name: &str, model: &str, conclusion: &str, solver_flags: &[&str]
             &[&[], &["--root-domains"]]
         };
         for &processor_flags in readings {
-            let _ = process_and_check(
-                name,
-                &model_path,
-                &scaffold_path,
-                derivation,
-                conclusion,
-                processor_flags,
+            let [(_, text, binary), (_, converted_text, converted_binary)] = ["text", "binary"]
+                .map(|encoding| {
+                    process_and_check(
+                        name,
+                        &model_path,
+                        &scaffold_path,
+                        derivation,
+                        conclusion,
+                        processor_flags,
+                        encoding,
+                    )
+                });
+            assert!(
+                text == converted_text,
+                "{name}: the binary proof is not converted"
+            );
+            assert!(
+                binary == converted_binary,
+                "{name}: the text proof is not converted"
             );
         }
     }
@@ -268,9 +285,10 @@ fn solve(name: &str, model: &str, solver_flags: &[&str]) -> (String, PathBuf) {
     (model_path, scaffold_path)
 }
 
-/// Process the scaffold into a proof in the block format that derives each nogood as
-/// `derivation` says, and check that the proof ends with the conclusion and, when a checker is
-/// given, that it checks. Returns what the processor printed and the proof.
+/// Process the scaffold into a proof in the block format, in `encoding`, that derives each nogood
+/// as `derivation` says, and check that the proof converts to itself, that it ends with the
+/// conclusion and, when a checker is given, that it checks. Returns what the processor printed and
+/// the proof as text and in the binary form.
 fn process_and_check(
     name: &str,
     model_path: &str,
@@ -278,7 +296,8 @@ fn process_and_check(
     derivation: &str,
     conclusion: &str,
     processor_flags: &[&str],
-) -> (String, String) {
+    encoding: &str,
+) -> (String, String, Vec<u8>) {
     let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("process_models");
     let root_domains = processor_flags.contains(&"--root-domains");
     let omit_premises = processor_flags.contains(&"--omit-premises");
@@ -287,10 +306,10 @@ fn process_and_check(
         (true, false) => ".root_domains",
         _ => "",
     };
-    let proof_path = directory.join(format!("{name}.{derivation}{reading}.croc"));
+    let proof_path = directory.join(format!("{name}.{derivation}{reading}.{encoding}.croc"));
 
     let processor_output = Command::new(env!("CARGO_BIN_EXE_pumpkin-proof-processor"))
-        .args(["--format", "blocks", "--proof-encoding", "text"])
+        .args(["--format", "blocks", "--proof-encoding", encoding])
         .args(["--nogood-derivation", derivation])
         .args(processor_flags)
         .arg(model_path)
@@ -305,7 +324,19 @@ fn process_and_check(
         String::from_utf8_lossy(&processor_output.stderr)
     );
 
-    let proof = std::fs::read_to_string(&proof_path).expect("the proof is written as text");
+    let proof = std::fs::read(&proof_path).expect("the proof is read");
+    let in_binary = encoding == "binary";
+    assert!(
+        convert(&proof, in_binary) == proof,
+        "{name} is not written back"
+    );
+    let other = convert(&proof, !in_binary);
+    let (text, binary) = if in_binary {
+        (other, proof)
+    } else {
+        (proof, other)
+    };
+    let proof = String::from_utf8(text).expect("the proof converts to text");
     assert!(
         proof.lines().any(|line| line == conclusion),
         "the {derivation} proof does not conclude {conclusion}"
@@ -323,6 +354,7 @@ fn process_and_check(
     (
         String::from_utf8_lossy(&processor_output.stdout).into_owned(),
         proof,
+        binary,
     )
 }
 
@@ -388,4 +420,12 @@ fn check_if_checker_given(model_path: &str, proof_path: &Path) {
         "the checker does not verify {}:\n{verdict}",
         proof_path.display()
     );
+}
+
+/// The proof converted, to the binary form if `binary`.
+fn convert(proof: &[u8], binary: bool) -> Vec<u8> {
+    let mut converted = vec![];
+    drcp_format::reader::blocks::convert(proof, &mut converted, binary)
+        .expect("the proof converts");
+    converted
 }

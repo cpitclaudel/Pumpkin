@@ -1,7 +1,8 @@
 #![cfg(test)] // workaround for https://github.com/rust-lang/rust-clippy/issues/11024
 
 //! The solver writes croc proofs, whole in the block proof type and as a scaffold headed by its
-//! preamble. When the environment variable `CROC_CHECK` names the fzn-croc-check binary, the
+//! preamble. A whole proof converts byte for byte to itself and to the proof in the other
+//! encoding. When the environment variable `CROC_CHECK` names the fzn-croc-check binary, the
 //! whole proofs are checked.
 
 use std::path::Path;
@@ -180,12 +181,12 @@ fn a_drcp_proof_skips_the_view_options() {
 }
 
 /// Solve the model with a croc proof of the block proof type for each nogood derivation and
-/// encoding, and check that each proof concludes as expected and, when a checker is given, that
-/// it checks.
+/// encoding, and check that each proof concludes as expected, that it converts to itself and to
+/// the proof in the other encoding and, when a checker is given, that it checks.
 fn check_block_proofs(name: &str, model: &str, conclusion: &str, flags: &[&str]) {
     let model_path = model_path(model);
     for derivation in ["resolution", "refutation"] {
-        for encoding in ["text", "binary"] {
+        let [text, binary] = ["text", "binary"].map(|encoding| {
             let proof_path = output_path(&format!("{name}.{derivation}.{encoding}.croc"));
             let output = Command::new(env!("CARGO_BIN_EXE_pumpkin-solver"))
                 .arg("--proof-path")
@@ -202,18 +203,36 @@ fn check_block_proofs(name: &str, model: &str, conclusion: &str, flags: &[&str])
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
-
-            if encoding == "text" {
-                let proof = std::fs::read_to_string(&proof_path).expect("the proof is text");
-                assert!(
-                    proof.lines().any(|line| line == conclusion),
-                    "the {derivation} proof does not conclude {conclusion}"
-                );
-            }
             check_if_checker_given(&model_path, &proof_path);
+            let proof = std::fs::read(&proof_path).expect("the proof is read");
             std::fs::remove_file(&proof_path).expect("the proof is removed");
+            proof
+        });
+        assert!(
+            String::from_utf8_lossy(&text)
+                .lines()
+                .any(|line| line == conclusion),
+            "the {derivation} proof does not conclude {conclusion}"
+        );
+        for (proof, other, in_binary) in [(&text, &binary, false), (&binary, &text, true)] {
+            assert!(
+                convert(proof, in_binary) == *proof,
+                "{name} is not written back"
+            );
+            assert!(
+                convert(proof, !in_binary) == *other,
+                "{name} is not converted"
+            );
         }
     }
+}
+
+/// The proof converted, to the binary form if `binary`.
+fn convert(proof: &[u8], binary: bool) -> Vec<u8> {
+    let mut converted = vec![];
+    drcp_format::reader::blocks::convert(proof, &mut converted, binary)
+        .expect("the proof converts");
+    converted
 }
 
 fn check_if_checker_given(model_path: &Path, proof_path: &Path) {
