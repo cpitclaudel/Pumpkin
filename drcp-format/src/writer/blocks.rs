@@ -279,7 +279,7 @@ impl<W: Write, Int: IntValue + Hash + Into<i64>> BlockProofWriter<W, Int> {
 
     /// Write an inference: the first line of a block, prefixed, or a continuation line, which
     /// is a binary record in the binary form.
-    fn write_inference(
+    pub(crate) fn write_inference(
         &mut self,
         prefix: Option<&str>,
         codes: &[NonZero<i32>],
@@ -464,7 +464,7 @@ impl<W: Write, Int: IntValue + Hash + Into<i64>> BlockProofWriter<W, Int> {
     /// Write a premise-free inference line of a refutation, `  > <consequent> c:<constraint>
     /// l:<label> [h:<positions>]`; in the binary form a record of tag 4 with the consequent,
     /// the constraint, the label and the hint.
-    fn write_premise_free_inference(
+    pub(crate) fn write_premise_free_inference(
         &mut self,
         consequent: NonZero<i32>,
         constraint: Option<ConstraintId>,
@@ -568,7 +568,7 @@ impl<W: Write, Int: IntValue + Hash + Into<i64>> BlockProofWriter<W, Int> {
     /// Write the declaration of an atomic constraint, `a <reference> [<name> <comparison>
     /// <constant>]`; in the binary form a record of tag 2, after a record of tag 1 with the name
     /// if it is new.
-    fn write_atomic(
+    pub(crate) fn write_atomic(
         &mut self,
         reference: NonZero<i32>,
         name: &str,

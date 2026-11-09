@@ -79,6 +79,7 @@
 //! assert_eq!(eof, None);
 //! ```
 
+pub mod blocks;
 mod error;
 mod parser;
 
