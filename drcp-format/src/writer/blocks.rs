@@ -161,6 +161,32 @@ fn parse_inference_line(line: &str) -> Option<(Vec<i64>, u32, u32, Vec<u32>)> {
         .then_some((codes, constraint, label, hint))
 }
 
+/// The reference, variable name, comparison and constant of an atomic constraint declaration,
+/// `a <reference> [<name> <comparison> <constant>]`, or `None` for another line.
+fn parse_atomic_line(line: &str) -> Option<(NonZero<i32>, &str, IntComparison, i64)> {
+    let (reference, atomic) = line.strip_prefix("a ")?.split_once(' ')?;
+    let atomic = atomic.strip_prefix('[')?.strip_suffix(']')?;
+    let mut fields = atomic.split(' ');
+    let (Some(name), Some(comparison), Some(constant), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return None;
+    };
+    let comparison = match comparison {
+        "<=" => IntComparison::LessEqual,
+        ">=" => IntComparison::GreaterEqual,
+        "==" => IntComparison::Equal,
+        "!=" => IntComparison::NotEqual,
+        _ => return None,
+    };
+    Some((
+        reference.parse().ok()?,
+        name,
+        comparison,
+        constant.parse().ok()?,
+    ))
+}
+
 /// Write `value` in LEB128.
 fn write_varint(writer: &mut impl Write, mut value: u64) -> std::io::Result<()> {
     loop {
@@ -179,24 +205,37 @@ fn write_signed(writer: &mut impl Write, value: i64) -> std::io::Result<()> {
 }
 
 impl<W: Write, Int: IntValue + Hash + Into<i64>> BlockProofWriter<W, Int> {
-    /// Write a line: a text record in the binary form, except an inference line inside a
-    /// resolution, refutation or dominance block, which is a binary record.
+    /// Write a line: a text record in the binary form, except an atomic constraint declaration
+    /// and an inference line inside a resolution, refutation or dominance block, which are
+    /// binary records.
     fn write_text_line(&mut self, line: &str) -> std::io::Result<()> {
         match line.as_bytes().first() {
-            Some(first) if !first.is_ascii_whitespace() => self.block_prefix = *first,
-            _ => {
+            Some(first) if !first.is_ascii_whitespace() => {
+                self.block_prefix = *first;
                 if self.binary_names.is_some()
-                    && matches!(self.block_prefix, b'r' | b'g' | b'w')
-                    && let Some((codes, constraint, label, hint)) = parse_inference_line(line)
+                    && let Some((reference, name, comparison, constant)) = parse_atomic_line(line)
                 {
-                    return self.write_inference_record(
-                        false,
-                        codes.iter().copied(),
-                        codes.len(),
-                        constraint,
-                        label,
-                        &hint,
-                    );
+                    return self.write_atomic(reference, name, comparison, constant);
+                }
+            }
+            _ => {
+                if self.binary_names.is_some() && matches!(self.block_prefix, b'r' | b'g' | b'w') {
+                    let (premise_free, inference) = match line.strip_prefix("  > ") {
+                        Some(rest) => (true, rest),
+                        None => (false, line),
+                    };
+                    if let Some((codes, constraint, label, hint)) = parse_inference_line(inference)
+                        && (!premise_free || codes.len() == 1)
+                    {
+                        return self.write_inference_record(
+                            premise_free,
+                            codes.iter().copied(),
+                            codes.len(),
+                            constraint,
+                            label,
+                            &hint,
+                        );
+                    }
                 }
             }
         }
